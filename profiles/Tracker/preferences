@@ -1,0 +1,21 @@
+####### User Interface: Columns ########
+
+# Packet list column format
+# Each pair of strings consists of a column title and its format
+gui.column.format:
+	"No.", "%m",
+	"Time", "%t",
+	"Protocol", "%p",
+	"Container", "%Cus:tracker.container_col:0:R",
+	"PPID", "%Cus:tracker.ppid_col:0:R",
+	"PID", "%Cus:tracker.pid_col:0:R",
+	"Process Name", "%Cus:tracker.processName:0:R",
+	"Rval", "%Cus:tracker.returnValue:0:R",
+	"Event", "%Cus:tracker.eventName:0:R",
+	"Syscall", "%Cus:tracker.syscall:0:R",
+    "Source IP", "%s",
+	"Destination IP", "%d",
+	"Info", "%i"
+
+# Show full name of nodes in stats tree (otherwise process tree command lines are cut because of '/' characters)
+statistics.st_sort_showfullname: TRUE

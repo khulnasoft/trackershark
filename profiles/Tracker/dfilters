@@ -1,0 +1,6 @@
+"Tracker event name" tracker.eventName == "sched_process_exec"
+"Process name" tracker.processName == "bash"
+"Container image" tracker.container.image == "ubuntu:latest"
+"Syscall" tracker.syscall == "execve"
+"PID in process lineage" tracker.process_lineage.pid == 1234
+"Process name in process lineage" tracker.process_lineage.process_name == "bash"

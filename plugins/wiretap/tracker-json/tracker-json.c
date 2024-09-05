@@ -1,0 +1,355 @@
+#define WS_BUILD_DLL
+
+#include <errno.h>
+#include <inttypes.h>
+
+#include "wtap-int.h"
+#include "file_wrappers.h"
+
+#include <wsutil/plugins.h>
+#include <wsutil/wslog.h>
+#include <ws_version.h>
+
+#ifndef WIRESHARK_PLUGIN_REGISTER // old plugin API
+WS_DLL_PUBLIC_DEF const char plugin_version[] = PLUGIN_VERSION;
+WS_DLL_PUBLIC_DEF const int plugin_want_major = WIRESHARK_VERSION_MAJOR;
+WS_DLL_PUBLIC_DEF const int plugin_want_minor = WIRESHARK_VERSION_MINOR;
+
+WS_DLL_PUBLIC void plugin_register(void);
+#ifdef WS_PLUGIN_DESC_FILE_TYPE
+WS_DLL_PUBLIC uint32_t plugin_describe(void);
+#endif
+#endif
+
+static int tracker_json_file_type_subtype;
+
+int tracker_json_get_file_type_subtype(void)
+{
+    return tracker_json_file_type_subtype;
+}
+
+struct tracker_json {
+    /*
+     * Event timestamps are stored inside the JSON data, which requires some (costly) parsing to retrieve.
+     * We parse the timestamps only once, so that they can be accessed directly when the event is retrieved again.
+     */
+    GHashTable *event_timestamps;
+};
+
+/**
+ * TODO: this line reading method may be bad for performance, consider a buffer read approach.
+ * Read a line from a file.
+ * The string is allocated by this function,
+ * and the caller is responsible for freeing it.
+ * Any read failure, including not finding a null-terminator
+ * after reading the specified max number of bytes,
+ * will result in a NULL being returned.
+ * Specifying a max_read of 0 means no limit.
+*/
+static gchar *file_gets_line(FILE_T file, gsize max_read)
+{
+    // no read limit
+    if (max_read == 0)
+        max_read = (gsize)-1;
+
+    // start with a 1024-byte allocation
+    gsize current_size = 1024;
+    signed char *buf = g_malloc(current_size);
+
+    int tmp;
+    gsize offset = 0;
+
+    while (offset < max_read)
+    {
+        // extend the buffer
+        if (offset >= current_size) {
+            // make sure we're not overflowing (if we are, something's seriously wrong)
+            if (current_size >= (gsize)(1 << 31)) { /* check overflow against 32-bit size_t, for extra caution */
+                g_free(buf);
+                return NULL;
+            }
+            current_size *= 2;
+            buf = g_realloc(buf, current_size);
+        }
+
+        tmp = file_getc(file);
+
+        buf[offset++] = (signed char)tmp;
+
+        // newline or null-terminator found or failed to read (EOF)
+        if (tmp == '\n' || tmp == 0 || tmp == -1)
+            break;
+    }
+
+    // nothing was read - we were at the EOF already
+    if (offset == 1)
+        goto fail;
+
+    // no newline or null-terminator found
+    if (offset == max_read && buf[offset - 1] != '\n' && buf[offset -1] != 0 && buf[offset - 1] != -1)
+        goto fail;
+
+    // replace trailing newline or EOF marker with null-terminator
+    if (buf[offset - 1] == '\n' || buf[offset -1] == -1)
+        buf[offset -1] = 0;
+    
+    // line may have a linefeed preceding the newline, replace with null-terminator
+    if (buf[offset - 2] == '\r')
+        buf[offset - 2] = 0;
+
+    return (gchar *)buf;
+
+fail:
+    g_free(buf);
+    return NULL;
+}
+
+/**
+ * Parse the timestamp manually because parsing the JSON is very expensive.
+ */
+static nstime_t *parse_ts(char *event)
+{
+    // Event should start like this: {"timestamp":1704197356801892470,....
+    // so timestamp is assumed to start at index 13
+    gsize ts_start = 13;
+    gint64 ts_int;
+    nstime_t *ts;
+
+    // skip any whitespace
+    while (event[ts_start] == ' ')
+        ts_start++;
+    
+    // make sure this is a digit
+    if (event[ts_start] < '0' || event[ts_start] > '9')
+        return NULL;
+    
+    // parse the timestamp to an int
+    errno = 0;
+    ts_int = g_ascii_strtoll(event + ts_start, NULL, 10);
+    if (errno != 0)
+        return NULL;
+    
+    ts = g_new(nstime_t, 1);
+    
+    // timestamp assumed to be in nanoseconds
+    ts->secs = (time_t)(ts_int / 1000000000);
+    ts->nsecs = (int)(ts_int % 1000000000);
+
+    return ts;
+}
+
+static gboolean tracker_json_read_event(FILE_T fh, wtap_rec *rec, Buffer *buf, int *err, gchar **err_info, gint64 offset, struct tracker_json *tracker_json)
+{
+    char *data, *data_copy = NULL;
+    size_t len;
+    nstime_t *ts;
+    gint64 *key;
+    gboolean res;
+
+    // read lines from the log file until an event is found
+    while (TRUE) {
+        // read a line
+        ws_noisy("reading line at offset 0x%08" PRIx64, offset);
+        if ((data = file_gets_line(fh, 0)) == NULL)
+            return FALSE;
+        
+        // tracker events start with {"timestamp":
+        if (strncmp(data, "{\"timestamp\":", 13) == 0)
+            break;
+        
+        offset = file_tell(fh);
+    }
+
+    ws_noisy("found an event");
+
+    // try retrieving timestamp from hash table
+    if ((ts = g_hash_table_lookup(tracker_json->event_timestamps, &offset)) == NULL) {
+        // timestamp not saved yet - parse it
+        data_copy = g_strdup(data);
+        if ((ts = parse_ts(data_copy)) == NULL) {
+            *err = WTAP_ERR_BAD_FILE;
+            *err_info = g_strdup_printf("cannot parse timestamp from event at offset 0x%08" PRIx64, offset);
+            res = FALSE;
+            goto cleanup;
+        }
+
+        // insert timestamp into hash table
+        key = g_new(gint64, 1);
+        *key = offset;
+        g_hash_table_insert(tracker_json->event_timestamps, key, ts);
+    }
+
+    // copy event data to buffer
+    len = strlen(data);
+    ws_buffer_assure_space(buf, len);
+    memcpy(ws_buffer_start_ptr(buf), data, len);
+
+    // set up record
+    rec->rec_type = REC_TYPE_PACKET;
+    rec->block = wtap_block_create(WTAP_BLOCK_PACKET);
+	rec->rec_header.packet_header.caplen = (guint32)len;
+	rec->rec_header.packet_header.len = (guint32)len;
+
+    rec->ts.secs = ts->secs;
+    rec->ts.nsecs = ts->nsecs;
+    rec->presence_flags = WTAP_HAS_TS;
+
+    res = TRUE;
+
+cleanup:
+    g_free(data);
+    if (data_copy != NULL)
+        g_free(data_copy);
+    
+    return res;
+}
+
+#if ((WIRESHARK_VERSION_MAJOR > 4) || ((WIRESHARK_VERSION_MAJOR == 4) && (WIRESHARK_VERSION_MINOR >= 3)))
+static bool
+#else
+static gboolean
+#endif
+tracker_json_read(wtap *wth, wtap_rec *rec, Buffer *buf, int *err, gchar **err_info, gint64 *data_offset)
+{
+    *data_offset = file_tell(wth->fh);
+
+    return tracker_json_read_event(wth->fh, rec, buf, err, err_info, *data_offset, wth->priv);
+}
+
+#if ((WIRESHARK_VERSION_MAJOR > 4) || ((WIRESHARK_VERSION_MAJOR == 4) && (WIRESHARK_VERSION_MINOR >= 3)))
+static bool
+#else
+static gboolean
+#endif
+tracker_json_seek_read(wtap *wth, gint64 seek_off, wtap_rec *rec, Buffer *buf, int *err, gchar **err_info)
+{
+    if (file_seek(wth->random_fh, seek_off, SEEK_SET, err) == -1)
+		return FALSE;
+    
+    return tracker_json_read_event(wth->random_fh, rec, buf, err, err_info, seek_off, wth->priv);
+}
+
+/**
+ * Free all the allocations we made.
+ * The allocation we made for struct tracker_json, referenced by wth->priv,
+ * is freed automatically by Wireshark.
+*/
+static void tracker_json_close(wtap *wth)
+{
+    struct tracker_json *tracker_json = (struct tracker_json *)wth->priv;
+
+    g_hash_table_destroy(tracker_json->event_timestamps);
+}
+
+static wtap_open_return_val
+tracker_json_open(wtap *wth, int *err, char **err_info)
+{
+    char buf[13]; // enough to hold {"timestamp":
+    struct tracker_json *tracker_json;
+
+    // assume the file is ours if it starts with an opening bracket (TODO: find a better way to determine if this is a tracker json log)
+    if (!wtap_read_bytes(wth->fh, &buf, sizeof(buf), err, err_info)) {
+        // EOF
+        if (*err == 0)
+            return WTAP_OPEN_NOT_MINE;
+        return WTAP_OPEN_ERROR;
+    }
+
+    // compare beginning of file to the beginning of the 2 possible JSON types (events and logs)
+    if (strncmp(buf, "{\"level\":", 9) != 0 && strncmp(buf, "{\"timestamp\":", 13) != 0) {
+        ws_warning("not ours");
+        return WTAP_OPEN_NOT_MINE;
+    }
+    
+    ws_info("file starts with '{\"level\":' or with '{\"timestamp\":', assuming it's a tracker json log");
+
+    // seek back to the beginning of the file
+    if (file_seek(wth->fh, 0, SEEK_SET, err) == -1)
+		return WTAP_OPEN_ERROR;
+    
+    tracker_json = g_new0(struct tracker_json, 1);
+    tracker_json->event_timestamps = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
+
+    wth->file_type_subtype = tracker_json_file_type_subtype;
+    wth->subtype_read = tracker_json_read;
+    wth->subtype_seek_read = tracker_json_seek_read;
+    wth->subtype_close = tracker_json_close;
+    wth->file_encap = WTAP_ENCAP_USER0;
+    wth->file_tsprec = WTAP_TSPREC_NSEC;
+    wth->snapshot_length = 0;
+    wth->priv = tracker_json;
+
+    wtap_add_generated_idb(wth);
+
+    return WTAP_OPEN_MINE;
+}
+
+/*
+ * Register with wiretap.
+ * Register how we can handle an unknown file to see if this is a valid
+ * usbdump file and register information about this file format.
+ */
+static const struct supported_block_type tracker_json_blocks_supported[] = {
+    /* We support packet blocks, with no comments or other options. */
+    { WTAP_BLOCK_PACKET, MULTIPLE_BLOCKS_SUPPORTED, NO_OPTIONS_SUPPORTED }
+};
+static const struct file_type_subtype_info tracker_json_info = {
+    "Tracker JSON Log",
+    "tracker-json",
+    "log",
+    "json",
+    FALSE,
+    BLOCKS_SUPPORTED(tracker_json_blocks_supported),
+    NULL,
+    NULL,
+    NULL
+};
+
+void
+wtap_register_tracker_json(void)
+{
+    struct open_info oi = {
+        "Tracker JSON",
+        OPEN_INFO_MAGIC,
+        tracker_json_open,
+        NULL,
+        NULL,
+        NULL
+    };
+
+    wtap_register_open_info(&oi, FALSE);
+
+    tracker_json_file_type_subtype = wtap_register_file_type_subtype(&tracker_json_info);
+}
+
+#ifdef WIRESHARK_PLUGIN_REGISTER // new plugin API
+static void plugin_register(void)
+#else
+void plugin_register(void)
+#endif
+{
+    static wtap_plugin plugin;
+
+    plugin.register_wtap_module = wtap_register_tracker_json;
+    wtap_register_plugin(&plugin);
+}
+
+#ifdef WIRESHARK_PLUGIN_REGISTER // new plugin API
+static struct ws_module module = {
+    .flags = WS_PLUGIN_DESC_FILE_TYPE,
+    .version = PLUGIN_VERSION,
+    .spdx_id = "GPL-2.0-or-later",
+    .home_url = "",
+    .blurb = "Tracker JSON log reader",
+    .register_cb = &plugin_register,
+};
+
+WIRESHARK_PLUGIN_REGISTER_WIRETAP(&module, 0)
+#endif
+
+#ifdef WS_PLUGIN_DESC_FILE_TYPE
+uint32_t plugin_describe(void)
+{
+    return WS_PLUGIN_DESC_FILE_TYPE;
+}
+#endif
